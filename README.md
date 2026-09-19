@@ -138,6 +138,3 @@ print(f"Extracted {len(slides)} slides to {pdf_path}")
 
 ---
 
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
