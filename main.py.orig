@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+DEFAULT_INTERVAL = 0.1
+DEFAULT_THRESHOLD = 0.05
+DEFAULT_STABLE_SAMPLES = 3
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def require_command(command: str) -> None:
+    if shutil.which(command) is None:
+        raise RuntimeError(
+            f"'{command}' was not found in PATH. "
+            f"Please install it first."
+        )
+
+
+def format_timestamp(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    seconds_remainder = seconds % 60
+    return f"{minutes:02d}:{seconds_remainder:05.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Downloading
+# ---------------------------------------------------------------------------
+
+def download_video(url: str, output_dir: Path) -> Path:
+    """
+    Download a YouTube video using yt-dlp.
+
+    We prefer MP4 video because OpenCV generally handles it well.
+    """
+
+    require_command("yt-dlp")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = output_dir / "video.%(ext)s"
+
+    command = [
+        "yt-dlp",
+        "--no-playlist",
+
+        # Prefer MP4 video.
+        "-f",
+        "bv*[ext=mp4]/bv*",
+
+        # Prefer an MP4 output where possible.
+        "--remux-video",
+        "mp4",
+
+        "-o",
+        str(video_path),
+
+        url,
+    ]
+
+    print("Downloading video...")
+    print()
+
+    result = subprocess.run(command)
+
+    if result.returncode != 0:
+        raise RuntimeError("yt-dlp failed to download the video.")
+
+    mp4_path = output_dir / "video.mp4"
+
+    if mp4_path.exists():
+        return mp4_path
+
+    # Fallback: look for whatever yt-dlp created.
+    candidates = [
+        p for p in output_dir.glob("video.*")
+        if p.is_file()
+    ]
+
+    if not candidates:
+        raise RuntimeError(
+            "Download completed, but the video file could not be found."
+        )
+
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# Slide detection
+# ---------------------------------------------------------------------------
+
+def make_signature(frame: np.ndarray) -> np.ndarray:
+    """
+    Create a small grayscale representation of a frame.
+
+    Keeping the signature small makes comparisons much faster.
+    """
+
+    height, width = frame.shape[:2]
+
+    # Ignore a tiny border. This helps reduce noise from video edges.
+    margin_x = int(width * 0.02)
+    margin_y = int(height * 0.02)
+
+    frame = frame[
+        margin_y:height - margin_y,
+        margin_x:width - margin_x,
+    ]
+
+    frame = cv2.resize(frame, (320, 180))
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Smooth small camera/compression noise.
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    return gray
+
+
+def difference_score(
+    reference: np.ndarray,
+    current: np.ndarray,
+) -> float:
+    """
+    Return a normalized visual difference score.
+
+    0.0 -> almost identical
+    1.0 -> extremely different
+    """
+
+    diff = cv2.absdiff(reference, current)
+
+    # Average difference.
+    mean_difference = float(diff.mean()) / 255.0
+
+    # How many pixels changed substantially?
+    changed_pixels = np.mean(diff > 25)
+
+    # Combine both measurements.
+    score = (
+        0.60 * mean_difference
+        + 0.40 * float(changed_pixels)
+    )
+
+    return score
+
+
+def extract_slides(
+    video_path: Path,
+    output_dir: Path,
+    interval: float,
+    threshold: float,
+    stable_samples: int,
+) -> list[dict]:
+    """
+    Detect slide changes and save representative frames.
+    """
+
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open video: {video_path}"
+        )
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if fps <= 0:
+        raise RuntimeError("Could not determine video FPS.")
+
+    total_frames = int(
+        cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
+
+    duration = total_frames / fps
+
+    print()
+    print(f"Video     : {video_path}")
+    print(f"FPS       : {fps:.2f}")
+    print(f"Duration  : {format_timestamp(duration)}")
+    print(f"Interval  : {interval}s")
+    print(f"Threshold : {threshold}")
+    print()
+
+    slides = []
+
+    reference_signature = None
+
+    candidate_count = 0
+    last_slide_time = -float("inf")
+
+    slide_number = 0
+
+    next_sample_frame = 0
+    frame_index = 0
+
+    while True:
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        if frame_index < next_sample_frame:
+            frame_index += 1
+            continue
+
+        timestamp = frame_index / fps
+
+        next_sample_frame = frame_index + max(
+            1,
+            int(interval * fps),
+        )
+
+        signature = make_signature(frame)
+
+        # First frame becomes the first slide.
+        if reference_signature is None:
+            slide_number += 1
+
+            slide_path = (
+                output_dir
+                / f"slide_{slide_number:03d}.jpg"
+            )
+
+            cv2.imwrite(
+                str(slide_path),
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 95],
+            )
+
+            slides.append(
+                {
+                    "slide": slide_number,
+                    "timestamp": timestamp,
+                    "timestamp_formatted": format_timestamp(
+                        timestamp
+                    ),
+                    "file": slide_path.name,
+                }
+            )
+
+            reference_signature = signature
+
+            print(
+                f"[{format_timestamp(timestamp)}] "
+                f"Slide {slide_number}"
+            )
+
+            frame_index += 1
+            continue
+
+        score = difference_score(
+            reference_signature,
+            signature,
+        )
+
+        # Significant difference from the current slide.
+        if score >= threshold:
+            candidate_count += 1
+        else:
+            candidate_count = 0
+
+        # Require multiple consecutive samples to change.
+        if candidate_count >= stable_samples:
+
+            # Avoid generating two slides too close together.
+            if timestamp - last_slide_time >= interval:
+
+                slide_number += 1
+
+                slide_path = (
+                    output_dir
+                    / f"slide_{slide_number:03d}.jpg"
+                )
+
+                cv2.imwrite(
+                    str(slide_path),
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95],
+                )
+
+                slides.append(
+                    {
+                        "slide": slide_number,
+                        "timestamp": timestamp,
+                        "timestamp_formatted": format_timestamp(
+                            timestamp
+                        ),
+                        "file": slide_path.name,
+                        "difference": round(score, 4),
+                    }
+                )
+
+                print(
+                    f"[{format_timestamp(timestamp)}] "
+                    f"Slide {slide_number} "
+                    f"(difference={score:.3f})"
+                )
+
+                reference_signature = signature
+                last_slide_time = timestamp
+
+            candidate_count = 0
+
+        frame_index += 1
+
+    cap.release()
+
+    metadata_path = output_dir / "slides.json"
+
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "video": str(video_path),
+                "interval": interval,
+                "threshold": threshold,
+                "stable_samples": stable_samples,
+                "slides": slides,
+            },
+            f,
+            indent=2,
+        )
+
+    return slides
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="youtube-slide-slicer",
+        description=(
+            "Download a YouTube video and extract presentation slides."
+        ),
+    )
+
+    parser.add_argument(
+        "input",
+        help="YouTube URL or local video file",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="output",
+        help="Output directory (default: output)",
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=(
+            f"Seconds between slide checks "
+            f"(default: {DEFAULT_INTERVAL})"
+        ),
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=(
+            f"Visual change threshold "
+            f"(default: {DEFAULT_THRESHOLD})"
+        ),
+    )
+
+    parser.add_argument(
+        "--stable-samples",
+        type=int,
+        default=DEFAULT_STABLE_SAMPLES,
+        help=(
+            f"Consecutive changed samples required "
+            f"(default: {DEFAULT_STABLE_SAMPLES})"
+        ),
+    )
+
+    parser.add_argument(
+        "--keep-video",
+        action="store_true",
+        help="Keep downloaded video in the output directory.",
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+
+    try:
+        input_path = Path(args.input)
+
+        if input_path.exists():
+            # Local video.
+            video_path = input_path
+
+            slides_dir = output_dir / "slides"
+
+            slides = extract_slides(
+                video_path=video_path,
+                output_dir=slides_dir,
+                interval=args.interval,
+                threshold=args.threshold,
+                stable_samples=args.stable_samples,
+            )
+
+        else:
+            # Treat input as URL.
+            work_dir = output_dir / "download"
+
+            video_path = download_video(
+                args.input,
+                work_dir,
+            )
+
+            slides_dir = output_dir / "slides"
+
+            slides = extract_slides(
+                video_path=video_path,
+                output_dir=slides_dir,
+                interval=args.interval,
+                threshold=args.threshold,
+                stable_samples=args.stable_samples,
+            )
+
+            if not args.keep_video:
+                shutil.rmtree(
+                    work_dir,
+                    ignore_errors=True,
+                )
+
+        print()
+        print("Done.")
+        print(f"Slides extracted: {len(slides)}")
+        print(f"Output: {slides_dir}")
+
+        return 0
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+
+    except Exception as exc:
+        print(f"\nError: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

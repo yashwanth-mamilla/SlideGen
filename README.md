@@ -23,8 +23,9 @@
 ### Install from Source
 ```bash
 # Clone repository
-git clone https://github.com/your-username/youtube-videos-slides.git
-cd youtube-videos-slides
+git clone https://github.com/your-username/slidegen.git
+cd slidegen
+
 
 # Install package in editable mode
 pip install -e .
