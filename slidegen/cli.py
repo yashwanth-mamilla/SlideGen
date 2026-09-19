@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from slidegen import __version__
 from slidegen.downloader import download_video, get_youtube_entries
 from slidegen.extractor import (
     DEFAULT_INTERVAL,
@@ -12,6 +13,21 @@ from slidegen.extractor import (
     extract_slides,
 )
 from slidegen.pdf import create_pdf
+from slidegen.utils import sanitize_filename
+
+BANNER = r"""
+  ____  _ _     _      ____            
+ / ___|| (_)___| | ___/ ___| ___ _ __  
+ \___ \| | / _` |/ _ \ |  _ / _ \ '_ \ 
+  ___) | || (_| |  __/ |_| |  __/ | | |
+ |____/|_|_|__,_|\___|\____|\___|_| |_|
+  SlideGen - Generating Slides from Youtube/Local videos v{version}
+"""
+
+
+
+def print_banner() -> None:
+    print(BANNER.format(version=__version__))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,7 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "input",
+        nargs="?",
+        default=None,
         help="YouTube video/playlist URL or local video file path",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show program's version number and exit",
     )
 
     parser.add_argument(
@@ -68,9 +94,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-from slidegen.utils import sanitize_filename
-
-
 def process_video_file(
     video_path: Path,
     output_dir: Path,
@@ -99,11 +122,23 @@ def process_video_file(
             print(f"Warning: Could not create PDF presentation: {exc}", file=sys.stderr)
 
 
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
+
+    effective_argv = sys.argv[1:] if argv is None else list(argv)
+    if not effective_argv:
+        print_banner()
+        parser.print_help()
+        return 0
+
     args = parser.parse_args(argv)
 
+    if not args.input:
+        print_banner()
+        parser.print_help()
+        return 0
+
+    print_banner()
     output_dir = Path(args.output)
 
     try:

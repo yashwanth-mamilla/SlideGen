@@ -25,3 +25,20 @@ def test_cli_local_video_path(tmp_path: Path):
     assert exit_code == 0
     assert (output_dir / "slides" / "slide_001.jpg").exists()
     assert (output_dir / "sample.pdf").exists()
+
+
+def test_cli_no_args_prints_help(capsys):
+    exit_code = main([])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "SlideGen - Generating Slides from Youtube/Local videos" in captured.out
+
+    assert "usage: slidegen" in captured.out
+
+
+def test_cli_version(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert "slidegen 0.1.0" in captured.out
